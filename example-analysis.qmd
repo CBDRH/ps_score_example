@@ -1,0 +1,379 @@
+---
+title: "Simulation and IPTW Analysis of PGT-A"
+format:
+  html:
+    toc: true
+execute:
+  warning: false
+  message: false
+---
+
+## Overview
+
+This document simulates embryo development and transfer, models PGT-A use, and estimates the association between PGT-A and live birth after the first transfer using inverse probability of treatment weighting (IPTW).
+
+The simulation functions are sourced from the `R/` directory.
+
+## Setup
+
+```{r}
+#| code-fold: true
+library(data.table)
+library(ggplot2)
+library(ggsci)
+library(WeightIt)
+library(cobalt)
+library(survey)
+library(crosstable)
+library(patchwork)
+
+r_files <- list.files("R", pattern = "\\.[Rr]$", full.names = TRUE)
+for (file in r_files) source(file)
+```
+
+## Simulation assumptions
+
+```{r}
+PGT_SENS <- 0.98
+PGT_SPEC <- 0.92
+n <- 5000
+```
+
+## Modelling PGT-A use
+
+The probability of PGT-A use increases with age, number of eggs, AMH, and the number of embryos reaching day 3 and day 5.
+
+```{r}
+f_do_pgt_prob1 <- function(
+  x,
+  intercept = qlogis(0.01),
+  age_log_odds_per_year = 0.46,
+  eggs_log_odds_per_log_increase = 0.15,
+  amh_log_odds_per_log_increase = 0.20,
+  day1_log_odds_per_log_increase = 0.10,
+  day3_log_odds_per_log_increase = 0.70,
+  day5_log_odds_per_log_increase = 2.00
+) {
+  log_odds <- intercept +
+    age_log_odds_per_year * (x$age - 35) +
+    eggs_log_odds_per_log_increase * log(x$n_eggs / 8) +
+    amh_log_odds_per_log_increase * log(x$amh / 2.5) +
+    day1_log_odds_per_log_increase * log1p(x$n_day1) +
+    day3_log_odds_per_log_increase * log1p(x$n_day3) +
+    day5_log_odds_per_log_increase * log1p(x$n_day5)
+
+  plogis(log_odds)
+}
+
+default_funs[["do_pgt_prob"]] <- f_do_pgt_prob1
+```
+
+## Simulation using the updated PGT-A mechanism
+
+```{r}
+set.seed(123)
+
+patients <- simulate_patients(n)
+
+embryos <- patients |>
+  simulate_eggs() |>
+  simulate_fert() |>
+  simulate_day3() |>
+  simulate_day5()
+
+embryos_tested <- embryos |>
+  simulate_pgt(
+    pgt_specificity = PGT_SPEC,
+    pgt_sensitivity = PGT_SENS
+  )
+
+transfers <- embryos_tested |>
+  select_order_embryos() |>
+  simulate_transfers()
+```
+
+## First-transfer analysis dataset
+
+The analysis is restricted to patients with at least one day-5 embryo. The outcome is live birth following the first transfer.
+
+```{r}
+study_et1 <- merge(
+  unique(
+    embryos_tested[
+      day5 == 1,
+      .(patient_id, age, amh, n_eggs, n_day1, n_day3, n_day5, do_pgt)
+    ]
+  ),
+  transfers[
+    transfer_number == 1,
+    .(patient_id, transfer_number,outcome)
+  ],
+  by = "patient_id",
+  all.x = TRUE
+)
+
+study_et1[, lb := fifelse(outcome == "live_birth",1,0,0)]
+study_et1[, et := fifelse(!is.na(transfer_number),1,0)]
+study_et1[, pgt_group := fifelse(do_pgt == 1,"pgt","no_pgt")]
+```
+
+## Descriptive statistics
+
+```{r}
+study_et1[, .(
+  n = .N,
+  live_birth_rate = mean(lb)
+), by = do_pgt]
+
+study_et1[et == 1, .(
+  n = .N,
+  live_birth_rate_per_et = mean(lb)
+), by = do_pgt]
+
+study_et1[et == 1 & age <= 35, .(
+  n = .N,
+  live_birth_rate_per_et = mean(lb)
+), by = do_pgt]
+
+study_et1[et == 1 & age > 35, .(
+  n = .N,
+  live_birth_rate_per_et = mean(lb)
+), by = do_pgt]
+
+study_et1[et == 1, .(
+  n = .N,
+  live_birth_rate_per_et = mean(lb)
+)]
+
+study_et1[et == 1 & age <= 35, .(
+  n = .N,
+  live_birth_rate_per_et = mean(lb)
+)]
+
+study_et1[et == 1 & age > 35, .(
+  n = .N,
+  live_birth_rate_per_et = mean(lb)
+)]
+
+
+```
+
+```{r}
+number_summary <- function(x, dig = 1, ...) {
+    c(`Med [IQR]` = mediqr(x, dig = dig, ...), 
+      `Mean (std)` = meansd(x, dig = dig, ...))
+}
+crosstable(study_et1,
+  cols=c("age","amh","n_eggs","n_day1","n_day3","n_day5","et","lb"),
+  percent_pattern = "{n} ({p_col})",
+  funs = c(` ` = number_summary),
+  by=pgt_group)
+```
+
+```{r}
+crosstable(study_et1,
+  cols=c("age","amh","n_eggs","n_day1","n_day3","n_day5","et","lb"),
+  percent_pattern = "{n} ({p_col})",
+  funs = c(` ` = number_summary))
+```
+
+## Propensity-score model and IPTW
+
+```{r}
+ps_formula <- do_pgt ~ age + amh + n_eggs + n_day1 + n_day3 + n_day5
+
+ps_glm <- glm(ps_formula, data = study_et1, family = binomial())
+summary(ps_glm)
+
+w_ate <- weightit(
+  formula = ps_formula,
+  data = study_et1,
+  method = "glm",
+  estimand = "ATE"
+)
+
+study_et1[, ps := w_ate$ps]
+study_et1[, iptw := w_ate$weights]
+```
+
+## Propensity-score and weight diagnostics
+
+### Propensity-score distributions
+
+```{r}
+p_ps <- ggplot(study_et1, aes(x = ps, fill = pgt_group)) +
+  geom_density(alpha = 0.4) +
+  scale_fill_npg(labels = c("no_pgt" = "No PGT-A","pgt" = "PGT-A")) +
+  scale_x_continuous(limits = c(0, 1)) +
+  labs(x = "Propensity score", fill = "Group") +
+  theme_minimal(base_size = 16)
+p_ps
+```
+
+### IPTW distributions
+
+```{r}
+iptw_plot_data <- study_et1[
+  iptw <= quantile(iptw, 0.99, na.rm = TRUE)
+]
+
+p_w <- ggplot(iptw_plot_data, aes(x = iptw, fill = pgt_group)) +
+  geom_density(alpha = 0.4) +
+    scale_fill_npg(labels = c("no_pgt" = "No PGT-A","pgt" = "PGT-A")) +
+  labs(x = "IPTW", fill = "Group") +
+  theme_minimal(base_size = 16)
+p_w
+```
+
+```{r,fig.height=4,fig.width=10}
+((p_ps + labs(title="(A)")) + 
+  (p_w + labs(title="(B)"))) +
+  plot_layout(guides = "collect")
+```
+
+## Covariate balance
+
+```{r,fig.height=6,fig.width=10}
+variable_labels <- data.frame(
+  old = c("age", "amh", "n_eggs", "n_day1","n_day3", "n_day5", "prop.score"),
+  new = c("Age", "AMH", "Num. eggs", "Num. day 1","Num. day 3", "Num. day 5", "Propensity score")
+)
+
+p_love_iptw <- love.plot(
+  w_ate,
+  stats = "mean.diffs",
+  abs = TRUE,
+  thresholds = c(m = 0.1),
+  var.order = "unadjusted",
+  line = FALSE,
+  stars = "raw",
+  var.names = variable_labels,
+  size = 4,
+  colors = c("grey40", "steelblue"),
+  shapes = c(16, 17)
+)
+
+p_love_iptw +
+  theme_minimal(base_size = 18) +
+  scale_color_npg() +
+  labs(
+    title = "Covariate balance before and after IPTW",
+    x = "Absolute standardised mean difference"
+  )
+
+summary(w_ate)
+```
+
+## Comparing the distribution of day-5 embryos
+
+```{r}
+p_age_un <- ggplot(study_et1, aes(x = age, fill = pgt_group)) +
+  geom_density(aes(), alpha = 0.3) +
+  scale_fill_npg(labels = c("no_pgt" = "No PGT-A","pgt" = "PGT-A")) +
+  labs(x = "Age", fill = "Group",title="Unadjusted") +
+  theme_minimal(base_size = 18)
+
+p_age_a <- ggplot(study_et1, aes(x = age, fill = pgt_group)) +
+  geom_density(aes(weight = iptw), alpha = 0.3) +
+  scale_fill_npg(labels = c("no_pgt" = "No PGT-A","pgt" = "PGT-A")) +
+  labs(x = "Age", fill = "Group",title="Adjusted") +
+  theme_minimal(base_size = 18)
+
+p_amh_a <- ggplot(study_et1, aes(x = amh, fill = pgt_group)) +
+  geom_density(aes(weight = iptw), alpha = 0.3) +
+  scale_x_log10() +
+  scale_fill_npg(labels = c("no_pgt" = "No PGT-A","pgt" = "PGT-A")) +
+  labs(x = "AMH", fill = "Group",title="") +
+  theme_minimal(base_size = 18)
+
+p_amh_un <- ggplot(study_et1, aes(x = amh, fill = pgt_group)) +
+  geom_density(aes(), alpha = 0.3) +
+  scale_x_log10() +
+  scale_fill_npg(labels = c("no_pgt" = "No PGT-A","pgt" = "PGT-A")) +
+  labs(x = "AMH", fill = "Group",title="") +
+  theme_minimal(base_size = 18)
+
+p_d5_un <- ggplot(study_et1, aes(x = n_day5, fill = pgt_group)) +
+  geom_histogram(aes(y = after_stat(density)), alpha = 0.7,binwidth=5,position="dodge") +
+  scale_fill_npg(labels = c("no_pgt" = "No PGT-A","pgt" = "PGT-A")) +
+  labs(x = "Num. day 5", fill = "Group",title="") +
+  theme_minimal(base_size = 18)
+
+p_d5_a <- ggplot(study_et1, aes(x = n_day5, fill = pgt_group)) +
+  geom_histogram(aes(weight = iptw,y = after_stat(density)), alpha = 0.7,binwidth=5,position="dodge") +
+  scale_fill_npg(labels = c("no_pgt" = "No PGT-A","pgt" = "PGT-A")) +
+  labs(x = "Num. day 5", fill = "Group",title="") +
+  theme_minimal(base_size = 18)
+```
+
+```{r,fig.height=10,fig.width=10}
+(p_age_un + p_age_a) / 
+  (p_amh_un + p_amh_a) / 
+  (p_d5_un + p_d5_a) +
+  plot_layout(guides = "collect") +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_text(size = 14),
+    legend.text = element_text(size = 12)
+  )
+```
+
+## IPTW outcome estimates
+
+### Weighted live-birth risks
+
+IPTW group live birth rate per patient
+
+```{r}
+weighted_risks <- study_et1[, .(
+  live_birth_risk = weighted.mean(lb, iptw)
+), by = do_pgt]
+
+weighted_risks
+```
+
+## Survey-weighted inference and confidence intervals
+
+Risk ratio (via log link binomial GLM)
+
+```{r}
+design_iptw <- svydesign(
+  ids = ~1,
+  weights = ~iptw,
+  data = study_et1
+)
+
+fit_svy <- svyglm(
+  lb ~ do_pgt,
+  design = design_iptw,
+  family = quasibinomial(link = "log")
+)
+
+summary(fit_svy)
+
+rr_ci <- exp(cbind(
+  estimate = coef(fit_svy),
+  confint(fit_svy)
+))
+
+rr_ci
+```
+
+Risk difference (via identity link binomial GLM)
+
+```{r}
+fit_svy <- svyglm(
+  lb ~ do_pgt,
+  design = design_iptw,
+  family = quasibinomial(link = "identity")
+)
+
+summary(fit_svy)
+
+diff_ci <- cbind(
+  estimate = coef(fit_svy),
+  confint(fit_svy)
+)
+
+diff_ci
+```
